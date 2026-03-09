@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_from_directory
 import subprocess
 import os
 import threading
@@ -6,39 +6,41 @@ import uuid
 import time
 import re
 import json
-import functools
 
 app = Flask(__name__)
 
 # Config — use env vars for server, fallback for local
 DEST = os.environ.get("YTDL_DOWNLOAD_DIR", os.path.expanduser("~/Desktop"))
 YTDLP = os.environ.get("YTDL_YTDLP_PATH", "yt-dlp")
-AUTH_USER = os.environ.get("YTDL_USER", "")
-AUTH_PASS = os.environ.get("YTDL_PASS", "")
 
 os.makedirs(DEST, exist_ok=True)
 
 # Track downloads: {id: {status, title, filename, error, progress, url}}
 downloads = {}
 
+# Rate limiting: max 5 downloads per IP per 15 minutes
+RATE_LIMIT = 5
+RATE_WINDOW = 900  # 15 minutes in seconds
+ip_requests = {}  # {ip: [timestamp, ...]}
 
-def check_auth(username, password):
-    return username == AUTH_USER and password == AUTH_PASS
+
+def check_rate_limit(ip):
+    now = time.time()
+    if ip not in ip_requests:
+        ip_requests[ip] = []
+    # Remove old entries outside the window
+    ip_requests[ip] = [t for t in ip_requests[ip] if now - t < RATE_WINDOW]
+    if len(ip_requests[ip]) >= RATE_LIMIT:
+        return False
+    ip_requests[ip].append(now)
+    return True
 
 
-def requires_auth(f):
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        if not AUTH_USER:
-            return f(*args, **kwargs)
-        auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return Response(
-                "Login required", 401,
-                {"WWW-Authenticate": 'Basic realm="YT Downloader"'}
-            )
-        return f(*args, **kwargs)
-    return decorated
+def get_client_ip():
+    # Behind Cloudflare/nginx — check forwarded headers
+    return request.headers.get("CF-Connecting-IP") or \
+           request.headers.get("X-Real-IP") or \
+           request.remote_addr
 
 
 def seconds_to_timestamp(s):
@@ -195,7 +197,6 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
 
 
 @app.route("/")
-@requires_auth
 def index():
     return """<!DOCTYPE html>
 <html lang="en">
@@ -484,8 +485,16 @@ function startDownload() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(payload)
     })
-    .then(r => r.json())
+    .then(r => {
+        if (r.status === 429) {
+            r.json().then(d => alert(d.error || 'Rate limit exceeded'));
+            btn.disabled = false;
+            return;
+        }
+        return r.json();
+    })
     .then(data => {
+        if (!data) return;
         btn.disabled = false;
         urlInput.value = '';
         if (currentMode === 'clip') {
@@ -574,8 +583,11 @@ function pollStatus(id) {
 
 
 @app.route("/download", methods=["POST"])
-@requires_auth
 def download():
+    ip = get_client_ip()
+    if not check_rate_limit(ip):
+        return jsonify({"error": "Rate limit exceeded. Max 5 downloads per 15 minutes."}), 429
+
     data = request.get_json()
     url = data.get("url", "").strip()
     if not url:
@@ -608,7 +620,6 @@ def download():
 
 
 @app.route("/status/<dl_id>")
-@requires_auth
 def status(dl_id):
     dl = downloads.get(dl_id)
     if not dl:
@@ -617,7 +628,6 @@ def status(dl_id):
 
 
 @app.route("/file/<path:filename>")
-@requires_auth
 def serve_file(filename):
     return send_from_directory(DEST, filename, as_attachment=True)
 
