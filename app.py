@@ -18,9 +18,9 @@ os.makedirs(DEST, exist_ok=True)
 # Track downloads: {id: {status, title, filename, error, progress, url}}
 downloads = {}
 
-# Rate limiting: max 5 downloads per IP per 15 minutes
-RATE_LIMIT = 5
-RATE_WINDOW = 900  # 15 minutes in seconds
+# Rate limiting: max 2 downloads per IP per hour
+RATE_LIMIT = 2
+RATE_WINDOW = 3600  # 1 hour in seconds
 ip_requests = {}  # {ip: [timestamp, ...]}
 
 
@@ -586,7 +586,7 @@ function pollStatus(id) {
 def download():
     ip = get_client_ip()
     if not check_rate_limit(ip):
-        return jsonify({"error": "Rate limit exceeded. Max 5 downloads per 15 minutes."}), 429
+        return jsonify({"error": "Rate limit exceeded. Max 2 downloads per hour."}), 429
 
     data = request.get_json()
     url = data.get("url", "").strip()
