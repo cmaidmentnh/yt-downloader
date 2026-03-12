@@ -12,6 +12,14 @@ app = Flask(__name__)
 # Config — use env vars for server, fallback for local
 DEST = os.environ.get("YTDL_DOWNLOAD_DIR", os.path.expanduser("~/Desktop"))
 YTDLP = os.environ.get("YTDL_YTDLP_PATH", "yt-dlp")
+COOKIES_FILE = os.environ.get("YTDL_COOKIES_FILE", "")
+
+
+def cookies_args():
+    """Return --cookies args if a cookies file is configured and exists."""
+    if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        return ["--cookies", COOKIES_FILE]
+    return []
 
 os.makedirs(DEST, exist_ok=True)
 
@@ -57,7 +65,7 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
 
         # Get title first
         result = subprocess.run(
-            [YTDLP, "--get-title", "--no-playlist", url],
+            [YTDLP, "--get-title", "--no-playlist"] + cookies_args() + [url],
             capture_output=True, text=True, timeout=30
         )
         title = result.stdout.strip() or "Unknown"
@@ -68,7 +76,7 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
             downloads[dl_id]["progress"] = "calculating"
 
             info_result = subprocess.run(
-                [YTDLP, "-j", "--no-playlist", url],
+                [YTDLP, "-j", "--no-playlist"] + cookies_args() + [url],
                 capture_output=True, text=True, timeout=60
             )
             try:
@@ -134,7 +142,7 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
         else:
             try:
                 check = subprocess.run(
-                    [YTDLP, "--print", "%(is_live)s", "--no-playlist", url],
+                    [YTDLP, "--print", "%(is_live)s", "--no-playlist"] + cookies_args() + [url],
                     capture_output=True, text=True, timeout=30
                 )
                 is_live = check.stdout.strip().lower() == "true"
@@ -142,7 +150,7 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
                 pass
 
         # Build command — live streams use HLS formats, regular videos use mp4
-        cmd = [YTDLP, "--no-playlist", "--restrict-filenames", "--newline", "--progress"]
+        cmd = [YTDLP, "--no-playlist", "--restrict-filenames", "--newline", "--progress"] + cookies_args()
 
         if is_live:
             cmd.extend(["-f", "301/300/94/93/92/91"])
