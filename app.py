@@ -170,8 +170,11 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
             text=True,
         )
 
+        output_lines = []
         for line in proc.stdout:
             line = line.strip()
+            if line:
+                output_lines.append(line)
             if line.startswith("[download]"):
                 match = re.match(r"\[download\]\s+(\d+\.?\d*)%", line)
                 if match:
@@ -189,7 +192,12 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
                     break
         else:
             downloads[dl_id]["status"] = "error"
-            downloads[dl_id]["error"] = "yt-dlp exited with error"
+            # Include the last few lines of yt-dlp output for debugging
+            error_lines = [l for l in output_lines[-10:] if "ERROR" in l or "error" in l.lower()]
+            if not error_lines:
+                error_lines = output_lines[-5:]
+            error_detail = "; ".join(error_lines) if error_lines else "unknown error"
+            downloads[dl_id]["error"] = f"yt-dlp exited with error: {error_detail}"
 
     except Exception as e:
         downloads[dl_id]["status"] = "error"
