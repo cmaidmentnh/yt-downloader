@@ -386,12 +386,16 @@ def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, liv
         # Try OAuth + InnerTube + ffmpeg first
         if access_token:
             try:
+                print(f"[{dl_id}] Using OAuth path (token: {access_token[:20]}...)")
                 run_download_oauth(dl_id, url, start_time, end_time, live_back, live_duration, access_token)
                 return
             except Exception as e:
+                print(f"[{dl_id}] OAuth path failed: {e}")
                 # Reset state and fall through to yt-dlp
                 downloads[dl_id]["status"] = "downloading"
                 downloads[dl_id]["error"] = None
+        else:
+            print(f"[{dl_id}] No OAuth token, using yt-dlp directly")
 
         # Fallback: yt-dlp
         run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration)
