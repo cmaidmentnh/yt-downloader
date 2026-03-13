@@ -37,7 +37,20 @@ RATE_WINDOW = 3600
 ip_requests = {}
 
 # User sessions: {session_id: {email, name, picture, access_token, refresh_token, token_expiry}}
-user_sessions = {}
+SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_sessions.json")
+
+def load_sessions():
+    try:
+        with open(SESSIONS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_sessions():
+    with open(SESSIONS_FILE, "w") as f:
+        json.dump(user_sessions, f)
+
+user_sessions = load_sessions()
 
 
 # ─── Rate Limiting ───
@@ -125,6 +138,7 @@ def get_valid_token(sid):
             if "access_token" in t:
                 s["access_token"] = t["access_token"]
                 s["token_expiry"] = time.time() + t.get("expires_in", 3600)
+                save_sessions()
             else:
                 return None
         else:
@@ -134,17 +148,19 @@ def get_valid_token(sid):
 
 # ─── YouTube InnerTube API ───
 
+INNERTUBE_API_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"  # Public YouTube API key
+
 def innertube_player(video_id, access_token):
-    # Try multiple client types — some work better with OAuth from datacenter IPs
+    # Try multiple client types with OAuth
     clients = [
+        {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "platform": "DESKTOP"},
         {"clientName": "ANDROID", "clientVersion": "19.29.37", "androidSdkVersion": 34, "platform": "MOBILE"},
         {"clientName": "IOS", "clientVersion": "19.29.1", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "platform": "MOBILE"},
-        {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "platform": "DESKTOP"},
     ]
     last_result = {}
     for client in clients:
         resp = requests.post(
-            "https://www.youtube.com/youtubei/v1/player",
+            f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}",
             headers={
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
@@ -158,7 +174,7 @@ def innertube_player(video_id, access_token):
         result = resp.json()
         ps = result.get("playabilityStatus", {})
         sd = result.get("streamingData", {})
-        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, reason={ps.get('reason','')[:60]}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}, keys={list(result.keys())[:8]}", flush=True)
+        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, reason={ps.get('reason','')[:60]}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}", flush=True)
         if ps.get("status") == "OK" and (sd.get("adaptiveFormats") or sd.get("hlsManifestUrl")):
             return result
         last_result = result
@@ -452,6 +468,7 @@ def auth_callback():
         "refresh_token": tokens.get("refresh_token", ""),
         "token_expiry": time.time() + tokens.get("expires_in", 3600),
     }
+    save_sessions()
 
     return redirect("/")
 
@@ -477,6 +494,7 @@ def auth_logout():
     sid = session.get("ytdl_session")
     if sid and sid in user_sessions:
         del user_sessions[sid]
+        save_sessions()
     session.pop("ytdl_session", None)
     session.pop("oauth_state", None)
     return jsonify({"ok": True})
