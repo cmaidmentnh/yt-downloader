@@ -158,7 +158,7 @@ def innertube_player(video_id, access_token):
         result = resp.json()
         ps = result.get("playabilityStatus", {})
         sd = result.get("streamingData", {})
-        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}", flush=True)
+        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, reason={ps.get('reason','')[:60]}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}, keys={list(result.keys())[:8]}", flush=True)
         if ps.get("status") == "OK" and (sd.get("adaptiveFormats") or sd.get("hlsManifestUrl")):
             return result
         last_result = result
