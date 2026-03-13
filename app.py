@@ -32,7 +32,7 @@ os.makedirs(DEST, exist_ok=True)
 downloads = {}
 
 # Rate limiting
-RATE_LIMIT = 2
+RATE_LIMIT = 20
 RATE_WINDOW = 3600
 ip_requests = {}
 
