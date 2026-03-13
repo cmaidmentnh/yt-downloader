@@ -1,8 +1,6 @@
 # YT Downloader
 
-A local web app for downloading YouTube videos and clips. Runs on your Mac at `http://ytdl`.
-
-![Screenshot](https://img.shields.io/badge/macOS-only-blue)
+A local web app for downloading YouTube videos and clips. Runs on your machine at `http://ytdl`.
 
 ## Features
 
@@ -14,7 +12,6 @@ A local web app for downloading YouTube videos and clips. Runs on your Mac at `h
 
 ## Requirements
 
-- macOS
 - Python 3
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)
 - [ffmpeg](https://ffmpeg.org/)
@@ -22,20 +19,38 @@ A local web app for downloading YouTube videos and clips. Runs on your Mac at `h
 
 ## Install
 
+### macOS
+
 ```bash
-# Install dependencies
 brew install ffmpeg
 pip3 install yt-dlp flask
-
-# Clone the repo
 git clone https://github.com/cmaidmentnh/yt-downloader.git
 cd yt-downloader
-
-# Install as a background service
 sudo ./install.sh
 ```
 
-This sets up a local web server at **http://ytdl** that runs in the background and starts automatically on login.
+### Windows
+
+1. Install [Python 3](https://www.python.org/downloads/), [ffmpeg](https://www.gyan.dev/ffmpeg/builds/), and [yt-dlp](https://github.com/yt-dlp/yt-dlp):
+   ```
+   pip install yt-dlp flask
+   ```
+2. Clone the repo:
+   ```
+   git clone https://github.com/cmaidmentnh/yt-downloader.git
+   cd yt-downloader
+   ```
+3. Right-click `install.bat` → **Run as administrator**
+
+### Linux
+
+```bash
+sudo apt install ffmpeg  # or your distro's package manager
+pip3 install yt-dlp flask
+git clone https://github.com/cmaidmentnh/yt-downloader.git
+cd yt-downloader
+sudo ./install.sh
+```
 
 ## Usage
 
@@ -49,8 +64,22 @@ Files are saved to your Desktop.
 
 ## Uninstall
 
+### macOS
 ```bash
 sudo launchctl bootout system/com.ytdl.app
 sudo rm /Library/LaunchDaemons/com.ytdl.app.plist
 sudo sed -i '' '/ytdl/d' /etc/hosts
+```
+
+### Windows (Run as Administrator)
+```
+schtasks /delete /tn "YTDownloader" /f
+findstr /v "ytdl" %SystemRoot%\System32\drivers\etc\hosts > %TEMP%\hosts.tmp && move /y %TEMP%\hosts.tmp %SystemRoot%\System32\drivers\etc\hosts
+```
+
+### Linux
+```bash
+sudo systemctl disable --now yt-downloader
+sudo rm /etc/systemd/system/yt-downloader.service
+sudo sed -i '/ytdl/d' /etc/hosts
 ```
