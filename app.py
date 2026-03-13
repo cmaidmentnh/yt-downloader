@@ -135,26 +135,34 @@ def get_valid_token(sid):
 # ─── YouTube InnerTube API ───
 
 def innertube_player(video_id, access_token):
-    resp = requests.post(
-        "https://www.youtube.com/youtubei/v1/player",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20250101.00.00",
-                    "hl": "en",
-                    "gl": "US",
-                }
+    # Try multiple client types — some work better with OAuth from datacenter IPs
+    clients = [
+        {"clientName": "ANDROID", "clientVersion": "19.29.37", "androidSdkVersion": 34, "platform": "MOBILE"},
+        {"clientName": "IOS", "clientVersion": "19.29.1", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "platform": "MOBILE"},
+        {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "platform": "DESKTOP"},
+    ]
+    last_result = {}
+    for client in clients:
+        resp = requests.post(
+            "https://www.youtube.com/youtubei/v1/player",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
             },
-        },
-        timeout=30,
-    )
-    return resp.json()
+            json={
+                "videoId": video_id,
+                "context": {"client": client},
+            },
+            timeout=30,
+        )
+        result = resp.json()
+        ps = result.get("playabilityStatus", {})
+        sd = result.get("streamingData", {})
+        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}", flush=True)
+        if ps.get("status") == "OK" and (sd.get("adaptiveFormats") or sd.get("hlsManifestUrl")):
+            return result
+        last_result = result
+    return last_result
 
 
 def pick_formats(info):
