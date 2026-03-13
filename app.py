@@ -79,16 +79,6 @@ def seconds_to_timestamp(s):
     return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
-def extract_video_id(url):
-    m = re.search(r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
-    return m.group(1) if m else None
-
-
-def safe_filename(title):
-    name = re.sub(r'[^\w\s\-\(\)]', '', title).strip()
-    return re.sub(r'\s+', '_', name)
-
-
 # ─── Google OAuth ───
 
 def get_google_auth_url(state):
@@ -146,150 +136,13 @@ def get_valid_token(sid):
     return s.get("access_token")
 
 
-# ─── YouTube InnerTube API ───
-
-INNERTUBE_API_KEY = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"  # Public YouTube API key
-
-def innertube_player(video_id, access_token):
-    # Try multiple client types with OAuth
-    clients = [
-        {"clientName": "WEB", "clientVersion": "2.20250101.00.00", "platform": "DESKTOP"},
-        {"clientName": "ANDROID", "clientVersion": "19.29.37", "androidSdkVersion": 34, "platform": "MOBILE"},
-        {"clientName": "IOS", "clientVersion": "19.29.1", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "platform": "MOBILE"},
-    ]
-    last_result = {}
-    for client in clients:
-        resp = requests.post(
-            f"https://www.youtube.com/youtubei/v1/player?key={INNERTUBE_API_KEY}",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "videoId": video_id,
-                "context": {"client": client},
-            },
-            timeout=30,
-        )
-        result = resp.json()
-        ps = result.get("playabilityStatus", {})
-        sd = result.get("streamingData", {})
-        print(f"  InnerTube {client['clientName']}: status={ps.get('status')}, reason={ps.get('reason','')[:60]}, formats={len(sd.get('adaptiveFormats', []))}, hls={bool(sd.get('hlsManifestUrl'))}, resp_keys={list(result.keys())}, http={resp.status_code}", flush=True)
-        if not sd.get("adaptiveFormats") and not sd.get("hlsManifestUrl"):
-            print(f"    Full playabilityStatus: {json.dumps(ps)[:300]}", flush=True)
-        if ps.get("status") == "OK" and (sd.get("adaptiveFormats") or sd.get("hlsManifestUrl")):
-            return result
-        last_result = result
-    return last_result
-
-
-def pick_formats(info):
-    streaming = info.get("streamingData", {})
-    adaptive = streaming.get("adaptiveFormats", [])
-
-    vids = [f for f in adaptive if f.get("mimeType", "").startswith("video/") and f.get("url")]
-    auds = [f for f in adaptive if f.get("mimeType", "").startswith("audio/") and f.get("url")]
-
-    # Prefer mp4/h264
-    mp4 = [f for f in vids if "mp4" in f.get("mimeType", "")]
-    if mp4:
-        vids = mp4
-    m4a = [f for f in auds if "mp4a" in f.get("mimeType", "")]
-    if m4a:
-        auds = m4a
-
-    best_v = max(vids, key=lambda f: f.get("height", 0), default=None) if vids else None
-    best_a = max(auds, key=lambda f: f.get("bitrate", 0), default=None) if auds else None
-    return best_v, best_a
-
-
 # ─── Download Logic ───
 
-def run_download_oauth(dl_id, url, start_time, end_time, live_back, live_duration, access_token):
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise Exception("Could not extract video ID from URL")
-
-    info = innertube_player(video_id, access_token)
-
-    ps = info.get("playabilityStatus", {})
-    if ps.get("status") not in ("OK", "LIVE_STREAM_OFFLINE"):
-        raise Exception(ps.get("reason") or ps.get("status", "Video unavailable"))
-
-    vd = info.get("videoDetails", {})
-    title = vd.get("title", "Unknown")
-    downloads[dl_id]["title"] = title
-    is_live = vd.get("isLive", False) or vd.get("isLiveContent", False)
-
-    # Handle live clip timestamps
-    if live_back is not None and live_duration is not None:
-        downloads[dl_id]["progress"] = "calculating"
-        duration = int(vd.get("lengthSeconds", 0))
-        if duration <= 0:
-            raise Exception("Could not determine stream duration")
-        live_back_sec = int(live_back) * 60
-        live_dur_sec = int(live_duration) * 60
-        clip_start = max(0, duration - live_back_sec)
-        clip_end = min(clip_start + live_dur_sec, duration)
-        start_time = seconds_to_timestamp(clip_start)
-        end_time = seconds_to_timestamp(clip_end)
-        downloads[dl_id]["live_timestamps"] = f"{start_time} - {end_time}"
-
-    # Get stream URLs
-    streaming = info.get("streamingData", {})
-    hls_url = streaming.get("hlsManifestUrl")
-    best_v, best_a = pick_formats(info)
-
-    if not best_v and not hls_url:
-        raise Exception("No downloadable format found (may need different auth scope)")
-
-    # Build filename
-    fname = safe_filename(title)
-    if start_time and end_time:
-        safe_start = start_time.replace(":", ".")
-        safe_end = end_time.replace(":", ".")
-        filename = f"{fname} [{safe_start}-{safe_end}].mp4"
-    else:
-        filename = f"{fname}.mp4"
-
-    output_path = os.path.join(DEST, filename)
-    downloads[dl_id]["progress"] = "downloading"
-
-    # Build ffmpeg command
-    cmd = ["ffmpeg", "-y"]
-
-    if hls_url and (is_live or not best_v):
-        # HLS stream (live or fallback)
-        if start_time and end_time:
-            cmd.extend(["-ss", start_time, "-to", end_time])
-        cmd.extend(["-i", hls_url, "-c", "copy"])
-    else:
-        # Adaptive formats — separate video + audio
-        if start_time and end_time:
-            cmd.extend(["-ss", start_time, "-to", end_time])
-        cmd.extend(["-i", best_v["url"]])
-
-        if best_a:
-            if start_time and end_time:
-                cmd.extend(["-ss", start_time, "-to", end_time])
-            cmd.extend(["-i", best_a["url"]])
-
-        cmd.extend(["-c", "copy", "-movflags", "+faststart"])
-
-    cmd.append(output_path)
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.strip()
-        if "time=" in line:
-            downloads[dl_id]["progress"] = "converting"
-    proc.wait()
-
-    if proc.returncode == 0 and os.path.exists(output_path):
-        downloads[dl_id]["status"] = "done"
-        downloads[dl_id]["filename"] = filename
-    else:
-        raise Exception("ffmpeg processing failed")
+def oauth_extra_args(access_token):
+    """Build yt-dlp args with OAuth Authorization header."""
+    args = ["--js-runtimes", "node"]
+    args.extend(["--add-header", f"Authorization:Bearer {access_token}"])
+    return args
 
 
 def extra_args():
@@ -300,10 +153,13 @@ def extra_args():
     return args
 
 
-def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration):
-    """Fallback: download using yt-dlp (may fail without auth on datacenter IPs)."""
+def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration, access_token=None):
+    """Download using yt-dlp, optionally with OAuth token."""
+    ea = oauth_extra_args(access_token) if access_token else extra_args()
+    print(f"[{dl_id}] yt-dlp extra args: {ea}", flush=True)
+
     result = subprocess.run(
-        [YTDLP, "--get-title", "--no-playlist"] + extra_args() + [url],
+        [YTDLP, "--get-title", "--no-playlist"] + ea + [url],
         capture_output=True, text=True, timeout=30
     )
     title = result.stdout.strip() or "Unknown"
@@ -313,7 +169,7 @@ def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duratio
     if live_back is not None and live_duration is not None:
         downloads[dl_id]["progress"] = "calculating"
         info_result = subprocess.run(
-            [YTDLP, "-j", "--no-playlist"] + extra_args() + [url],
+            [YTDLP, "-j", "--no-playlist"] + ea + [url],
             capture_output=True, text=True, timeout=60
         )
         try:
@@ -350,14 +206,14 @@ def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duratio
     if not is_live:
         try:
             check = subprocess.run(
-                [YTDLP, "--print", "%(is_live)s", "--no-playlist"] + extra_args() + [url],
+                [YTDLP, "--print", "%(is_live)s", "--no-playlist"] + ea + [url],
                 capture_output=True, text=True, timeout=30
             )
             is_live = check.stdout.strip().lower() == "true"
         except Exception:
             pass
 
-    cmd = [YTDLP, "--no-playlist", "--restrict-filenames", "--newline", "--progress"] + extra_args()
+    cmd = [YTDLP, "--no-playlist", "--restrict-filenames", "--newline", "--progress"] + ea
 
     if is_live:
         cmd.extend(["-f", "301/300/94/93/92/91"])
@@ -409,24 +265,11 @@ def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duratio
 def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, live_duration=None, access_token=None):
     try:
         downloads[dl_id]["status"] = "downloading"
-
-        # Try OAuth + InnerTube + ffmpeg first
         if access_token:
-            try:
-                print(f"[{dl_id}] Using OAuth path (token: {access_token[:20]}...)", flush=True)
-                run_download_oauth(dl_id, url, start_time, end_time, live_back, live_duration, access_token)
-                return
-            except Exception as e:
-                print(f"[{dl_id}] OAuth path failed: {e}", flush=True)
-                # Reset state and fall through to yt-dlp
-                downloads[dl_id]["status"] = "downloading"
-                downloads[dl_id]["error"] = None
+            print(f"[{dl_id}] Using OAuth token (token: {access_token[:20]}...)", flush=True)
         else:
             print(f"[{dl_id}] No OAuth token, using yt-dlp directly", flush=True)
-
-        # Fallback: yt-dlp
-        run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration)
-
+        run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration, access_token)
     except Exception as e:
         downloads[dl_id]["status"] = "error"
         downloads[dl_id]["error"] = str(e)
