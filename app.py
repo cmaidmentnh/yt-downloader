@@ -6,6 +6,9 @@ import uuid
 import time
 import re
 import json
+import tempfile
+import urllib.request
+from datetime import datetime, timezone
 
 app = Flask(__name__)
 
@@ -29,14 +32,17 @@ def seconds_to_timestamp(s):
 # ─── Download Logic ───
 
 def extra_args():
-    args = []
+    # ejs:github auto-fetches the JS challenge solver script needed to bypass
+    # YouTube's n-challenge — without it, downloads fall back to formats that
+    # may be missing or low quality.
+    args = ["--remote-components", "ejs:github"]
     cookies_file = os.environ.get("YTDL_COOKIES_FILE", "")
     if cookies_file and os.path.isfile(cookies_file):
         args.extend(["--cookies", cookies_file])
     return args
 
 
-def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration):
+def run_download_ytdlp(dl_id, url, start_time, end_time):
     result = subprocess.run(
         [YTDLP, "--get-title", "--no-playlist"] + extra_args() + [url],
         capture_output=True, text=True, timeout=30
@@ -44,58 +50,21 @@ def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duratio
     title = result.stdout.strip() or "Unknown"
     downloads[dl_id]["title"] = title
 
-    # For live stream clips, calculate timestamps
-    if live_back is not None and live_duration is not None:
-        downloads[dl_id]["progress"] = "calculating"
-        info_result = subprocess.run(
-            [YTDLP, "-j", "--no-playlist"] + extra_args() + [url],
-            capture_output=True, text=True, timeout=60
+    # Detect live stream (for full downloads or clip mode on live)
+    is_live = False
+    try:
+        check = subprocess.run(
+            [YTDLP, "--print", "%(is_live)s", "--no-playlist"] + extra_args() + [url],
+            capture_output=True, text=True, timeout=30
         )
-        try:
-            info = json.loads(info_result.stdout)
-        except (json.JSONDecodeError, TypeError):
-            raise Exception("Could not get stream info")
-
-        current_duration = 0
-        release_ts = info.get("release_timestamp")
-        if release_ts and release_ts > 0:
-            current_duration = int(time.time() - release_ts)
-        if current_duration <= 0:
-            dur = info.get("duration")
-            if dur and dur > 0:
-                current_duration = int(dur)
-        if current_duration <= 0:
-            for fmt in info.get("formats", []):
-                fdur = fmt.get("duration")
-                if fdur and fdur > 0:
-                    current_duration = max(current_duration, int(fdur))
-        if current_duration <= 0:
-            raise Exception("Could not determine how long stream has been live")
-
-        live_back_sec = int(live_back) * 60
-        live_dur_sec = int(live_duration) * 60
-        clip_start = max(0, current_duration - live_back_sec)
-        clip_end = min(clip_start + live_dur_sec, current_duration)
-        start_time = seconds_to_timestamp(clip_start)
-        end_time = seconds_to_timestamp(clip_end)
-        downloads[dl_id]["live_timestamps"] = f"{start_time} - {end_time}"
-
-    # Detect live stream
-    is_live = live_back is not None
-    if not is_live:
-        try:
-            check = subprocess.run(
-                [YTDLP, "--print", "%(is_live)s", "--no-playlist"] + extra_args() + [url],
-                capture_output=True, text=True, timeout=30
-            )
-            is_live = check.stdout.strip().lower() == "true"
-        except Exception:
-            pass
+        is_live = check.stdout.strip().lower() == "true"
+    except Exception:
+        pass
 
     cmd = [YTDLP, "--no-playlist", "--restrict-filenames", "--newline", "--progress"] + extra_args()
 
     if is_live:
-        cmd.extend(["-f", "301/300/94/93/92/91"])
+        cmd.extend(["-f", "96/95/94/93/92/91"])
         cmd.extend(["--sub-langs", "all,-live_chat"])
     else:
         cmd.extend(["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"])
@@ -141,10 +110,185 @@ def run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duratio
         raise Exception(f"yt-dlp exited with error: {error_detail}")
 
 
-def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, live_duration=None):
+def _parse_clock_time(s, reference_day_local):
+    """Parse HH:MM or H:MM (24-hour, local time) on the reference day, return aware datetime."""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
+    if not m:
+        raise Exception(f"Invalid clock time '{s}' — expected HH:MM (24-hour)")
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        raise Exception(f"Invalid clock time '{s}'")
+    local_tz = datetime.now().astimezone().tzinfo
+    return reference_day_local.replace(hour=hh, minute=mm, second=0, microsecond=0, tzinfo=local_tz)
+
+
+def run_download_live_clip(dl_id, url, live_back=None, live_duration=None,
+                           live_clock_start=None, live_clock_end=None):
+    """Download a clip from a live stream by extracting HLS segments directly.
+
+    Two modes:
+      - Relative: live_back (minutes ago) + live_duration (minutes)
+      - Absolute: live_clock_start + live_clock_end (HH:MM local time)
+    """
+    # Get video title
+    result = subprocess.run(
+        [YTDLP, "--get-title", "--no-playlist"] + extra_args() + [url],
+        capture_output=True, text=True, timeout=30
+    )
+    title = result.stdout.strip() or "Unknown"
+    downloads[dl_id]["title"] = title
+    downloads[dl_id]["progress"] = "calculating"
+
+    # Get HLS manifest URL for best available quality
+    result = subprocess.run(
+        [YTDLP, "-f", "96/95/94/93/92/91", "-g", "--no-playlist"] + extra_args() + [url],
+        capture_output=True, text=True, timeout=30
+    )
+    manifest_url = result.stdout.strip()
+    if not manifest_url:
+        raise Exception("Could not get stream manifest URL")
+
+    # Fetch the full HLS manifest (contains all DVR segments)
+    resp = urllib.request.urlopen(manifest_url, timeout=30)
+    manifest_data = resp.read().decode()
+    lines = manifest_data.strip().split("\n")
+
+    # Parse DVR-window start time from EXT-X-PROGRAM-DATE-TIME.
+    # For long-running streams, this is the start of the available DVR window,
+    # NOT the start of the stream itself.
+    window_start = None
+    for line in lines:
+        if line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            date_str = line.split(":", 1)[1].strip()
+            window_start = datetime.fromisoformat(date_str)
+            break
+    if window_start is None:
+        raise Exception("Could not determine DVR window start from manifest")
+
+    # Parse EXT-X-MEDIA-SEQUENCE: the segment number of the first segment in
+    # this manifest. This equals the first sq/N we see, which corresponds to
+    # window_start. Non-zero for long streams with a rolling DVR window.
+    media_sequence = 0
+    for line in lines:
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            media_sequence = int(line.split(":")[1].strip())
+            break
+
+    # Parse segment duration from manifest (default 5s)
+    seg_duration = 5
+    for line in lines:
+        if line.startswith("#EXT-X-TARGETDURATION:"):
+            seg_duration = int(line.split(":")[1].strip())
+            break
+
+    # Calculate target offsets relative to window start
+    if live_clock_start and live_clock_end:
+        # Absolute clock-time mode — interpret times on the local day of window_start
+        window_start_local = window_start.astimezone()
+        clock_from = _parse_clock_time(live_clock_start, window_start_local)
+        clock_to = _parse_clock_time(live_clock_end, window_start_local)
+        if clock_to <= clock_from:
+            raise Exception("End time must be after start time")
+        target_start_sec = (clock_from - window_start).total_seconds()
+        target_end_sec = (clock_to - window_start).total_seconds()
+        if target_start_sec < 0:
+            raise Exception(
+                f"{live_clock_start} is before the available DVR window "
+                f"(starts at {window_start_local.strftime('%H:%M')} local)"
+            )
+        label = f"{live_clock_start}–{live_clock_end} local"
+    else:
+        live_back_sec = int(live_back) * 60
+        live_dur_sec = int(live_duration) * 60
+        now = datetime.now(timezone.utc)
+        window_age_sec = (now - window_start).total_seconds()
+        target_start_sec = max(0, window_age_sec - live_back_sec)
+        target_end_sec = target_start_sec + live_dur_sec
+        label = f"{int(live_back)}min ago for {int(live_duration)}min"
+
+    live_dur_sec = target_end_sec - target_start_sec
+    # Segment numbers are offset by media_sequence (the sq of the first segment)
+    start_sq = media_sequence + int(target_start_sec / seg_duration)
+    end_sq = media_sequence + int(target_end_sec / seg_duration)
+
+    # Extract all segment URLs from manifest
+    seg_urls = {}
+    for line in lines:
+        if line.startswith("http") and "/sq/" in line:
+            m = re.search(r"/sq/(\d+)/", line)
+            if m:
+                seg_urls[int(m.group(1))] = line.strip()
+
+    # Collect target segments
+    target_segments = [(sq, seg_urls[sq]) for sq in range(start_sq, end_sq + 1) if sq in seg_urls]
+    if not target_segments:
+        raise Exception(f"No segments found for range sq/{start_sq}-{end_sq}")
+
+    actual_start = seconds_to_timestamp(int(target_start_sec))
+    actual_end = seconds_to_timestamp(int(target_end_sec))
+    downloads[dl_id]["live_timestamps"] = f"{actual_start} - {actual_end} ({label})"
+
+    # Build custom m3u8 playlist with only the target segments
+    playlist_path = os.path.join(tempfile.gettempdir(), f"ytdl_live_{dl_id}.m3u8")
+    with open(playlist_path, "w") as f:
+        f.write("#EXTM3U\n#EXT-X-VERSION:3\n")
+        f.write(f"#EXT-X-TARGETDURATION:{seg_duration}\n")
+        f.write(f"#EXT-X-MEDIA-SEQUENCE:{target_segments[0][0]}\n")
+        for sq, seg_url in target_segments:
+            f.write(f"#EXTINF:{seg_duration}.0,\n{seg_url}\n")
+        f.write("#EXT-X-ENDLIST\n")
+
+    # Download with ffmpeg (copy, no re-encode)
+    safe_title = re.sub(r"[^\w\s\-.]", "_", title)[:80].strip("_")
+    output_path = os.path.join(DEST, f"{safe_title}_live_clip.mp4")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-i", playlist_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output_lines = []
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            output_lines.append(line)
+        m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+        if m:
+            h, mins, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            elapsed = h * 3600 + mins * 60 + s
+            pct = min(99, int(elapsed / live_dur_sec * 100))
+            downloads[dl_id]["progress"] = str(pct)
+
+    proc.wait()
+
+    try:
+        os.remove(playlist_path)
+    except OSError:
+        pass
+
+    if proc.returncode == 0:
+        downloads[dl_id]["status"] = "done"
+        downloads[dl_id]["filename"] = os.path.basename(output_path)
+    else:
+        error_detail = "; ".join(output_lines[-5:]) if output_lines else "unknown error"
+        raise Exception(f"ffmpeg exited with error: {error_detail}")
+
+
+def run_download(dl_id, url, start_time=None, end_time=None, live_back=None, live_duration=None,
+                 live_clock_start=None, live_clock_end=None):
     try:
         downloads[dl_id]["status"] = "downloading"
-        run_download_ytdlp(dl_id, url, start_time, end_time, live_back, live_duration)
+        if live_clock_start and live_clock_end:
+            run_download_live_clip(dl_id, url, live_clock_start=live_clock_start, live_clock_end=live_clock_end)
+        elif live_back is not None and live_duration is not None:
+            run_download_live_clip(dl_id, url, live_back=live_back, live_duration=live_duration)
+        else:
+            run_download_ytdlp(dl_id, url, start_time, end_time)
     except Exception as e:
         downloads[dl_id]["status"] = "error"
         downloads[dl_id]["error"] = str(e)
@@ -378,17 +522,35 @@ def index():
         </div>
 
         <div class="mode-section" id="liveSection">
-            <div class="live-row">
-                <label for="liveBack">Go back</label>
-                <input type="number" id="liveBack" placeholder="30" min="1">
-                <span class="unit">min</span>
+            <div class="mode-toggle" style="margin-bottom:12px">
+                <button class="active" id="liveModeRelBtn" onclick="setLiveMode('rel')">Minutes ago</button>
+                <button id="liveModeClockBtn" onclick="setLiveMode('clock')">Clock time</button>
             </div>
-            <div class="live-row">
-                <label for="liveDuration">Record for</label>
-                <input type="number" id="liveDuration" placeholder="10" min="1">
-                <span class="unit">min</span>
+
+            <div id="liveRelSection">
+                <div class="live-row">
+                    <label for="liveBack">Go back</label>
+                    <input type="number" id="liveBack" placeholder="30" min="1">
+                    <span class="unit">min</span>
+                </div>
+                <div class="live-row">
+                    <label for="liveDuration">Record for</label>
+                    <input type="number" id="liveDuration" placeholder="10" min="1">
+                    <span class="unit">min</span>
+                </div>
+                <p class="live-hint">Calculated from current stream position</p>
             </div>
-            <p class="live-hint">Calculates timestamps from current stream position</p>
+
+            <div id="liveClockSection" style="display:none">
+                <div class="time-row">
+                    <label for="liveClockStart">From</label>
+                    <input type="text" id="liveClockStart" placeholder="10:35">
+                    <label for="liveClockEnd">To</label>
+                    <input type="text" id="liveClockEnd" placeholder="10:42">
+                    <span class="time-hint">HH:MM (24-hour, local time)</span>
+                </div>
+                <p class="live-hint">Exact wall-clock times on the stream's start day</p>
+            </div>
         </div>
     </div>
 
@@ -400,6 +562,7 @@ const urlInput = document.getElementById('url');
 const btn = document.getElementById('btn');
 let activePolls = {};
 let currentMode = 'full';
+let currentLiveMode = 'rel';
 
 function setMode(mode) {
     currentMode = mode;
@@ -408,6 +571,14 @@ function setMode(mode) {
     document.getElementById('modeLiveBtn').className = mode === 'live' ? 'active' : '';
     document.getElementById('clipSection').className = 'mode-section' + (mode === 'clip' ? ' visible' : '');
     document.getElementById('liveSection').className = 'mode-section' + (mode === 'live' ? ' visible' : '');
+}
+
+function setLiveMode(mode) {
+    currentLiveMode = mode;
+    document.getElementById('liveModeRelBtn').className = mode === 'rel' ? 'active' : '';
+    document.getElementById('liveModeClockBtn').className = mode === 'clock' ? 'active' : '';
+    document.getElementById('liveRelSection').style.display = mode === 'rel' ? '' : 'none';
+    document.getElementById('liveClockSection').style.display = mode === 'clock' ? '' : 'none';
 }
 
 urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
@@ -427,12 +598,21 @@ function startDownload() {
         payload.end_time = et;
         clipLabel = 'Clip: ' + st + ' - ' + et;
     } else if (currentMode === 'live') {
-        const back = document.getElementById('liveBack').value.trim();
-        const dur = document.getElementById('liveDuration').value.trim();
-        if (!back || !dur) { document.getElementById('liveBack').focus(); return; }
-        payload.live_back = back;
-        payload.live_duration = dur;
-        clipLabel = 'Live: ' + back + 'min ago, record ' + dur + 'min';
+        if (currentLiveMode === 'clock') {
+            const from = document.getElementById('liveClockStart').value.trim();
+            const to = document.getElementById('liveClockEnd').value.trim();
+            if (!from || !to) { document.getElementById('liveClockStart').focus(); return; }
+            payload.live_clock_start = from;
+            payload.live_clock_end = to;
+            clipLabel = 'Live: ' + from + '–' + to + ' local';
+        } else {
+            const back = document.getElementById('liveBack').value.trim();
+            const dur = document.getElementById('liveDuration').value.trim();
+            if (!back || !dur) { document.getElementById('liveBack').focus(); return; }
+            payload.live_back = back;
+            payload.live_duration = dur;
+            clipLabel = 'Live: ' + back + 'min ago, record ' + dur + 'min';
+        }
     }
 
     btn.disabled = true;
@@ -541,6 +721,8 @@ def download():
     end_time = data.get("end_time", "").strip() or None
     live_back = data.get("live_back") or None
     live_duration = data.get("live_duration") or None
+    live_clock_start = (data.get("live_clock_start") or "").strip() or None
+    live_clock_end = (data.get("live_clock_end") or "").strip() or None
 
     dl_id = str(uuid.uuid4())[:8]
     downloads[dl_id] = {
@@ -555,7 +737,8 @@ def download():
 
     thread = threading.Thread(
         target=run_download,
-        args=(dl_id, url, start_time, end_time, live_back, live_duration),
+        args=(dl_id, url, start_time, end_time, live_back, live_duration,
+              live_clock_start, live_clock_end),
         daemon=True,
     )
     thread.start()

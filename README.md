@@ -6,7 +6,9 @@ A local web app for downloading YouTube videos and clips. Runs on your machine a
 
 - Download full videos as MP4
 - Clip specific timestamps from any video
-- Clip live streams by specifying "go back X minutes, record Y minutes"
+- Clip live streams two ways:
+  - "Go back X minutes, record Y minutes"
+  - Exact wall-clock times (e.g. 10:35–10:42 local)
 - Progress tracking with live percentage updates
 - Downloads to your Desktop
 
@@ -58,9 +60,30 @@ Open **http://ytdl** in your browser.
 
 - **Full Video** — Paste a YouTube URL, click Download
 - **Clip** — Switch to Clip mode, enter start/end timestamps (H:MM:SS)
-- **Live Clip** — Switch to Live Clip mode, enter how many minutes back and how long to record
+- **Live Clip** — Switch to Live Clip mode, then pick:
+  - **Minutes ago** — "go back X min, record Y min" from the live edge
+  - **Clock time** — exact HH:MM (24-hour, local time) range within the DVR window
 
 Files are saved to your Desktop.
+
+## Update
+
+### macOS / Linux
+
+```bash
+cd yt-downloader
+sudo ./update.sh
+```
+
+This pulls the latest code and restarts the service.
+
+### Windows
+
+```
+cd yt-downloader
+git pull
+```
+Then restart the scheduled task from Task Scheduler (or reboot).
 
 ## Uninstall
 
